@@ -1,2 +1,9 @@
 emily-cli/Cargo.lock
 emily-cli/config.toml
+emily-fe/dist
+emily-fe/Cargo.lock
+emily-fe/Cargo.lock
+target
+**/target
+Cargo.lock
+emily-tauri/gen/schemas
