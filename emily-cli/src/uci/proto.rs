@@ -56,6 +56,10 @@ impl Protocol {
         }
     }
 
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
     pub fn init(&mut self) -> Result<Headers> {
         self.send(Command::Uci)?;
 
@@ -71,6 +75,14 @@ impl Protocol {
 
         Ok(Headers)
     }
+
+    pub fn debug(&mut self, debug: bool) -> Result<()> {
+        self.send(Command::Debug(debug))
+    }
+
+    pub fn set_option(&mut self, option: String, value: String) -> Result<()> {
+        self.send(Command::SetOption(option, value))
+    }
 }
 
 #[derive(Debug)]
@@ -79,6 +91,8 @@ pub struct Headers;
 #[derive(Debug)]
 enum Command {
     Uci,
+    Debug(bool),
+    SetOption(String, String),
 }
 
 impl Display for Command {
@@ -87,6 +101,9 @@ impl Display for Command {
 
         match self {
             Uci => write!(f, "uci"),
+            Debug(true) => write!(f, "debug on"),
+            Debug(false) => write!(f, "debug off"),
+            SetOption(name, value) => write!(f, "setoption name {name} value {value}"),
         }
     }
 }

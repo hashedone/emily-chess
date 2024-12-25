@@ -1,3 +1,11 @@
 # This is a template for the Emily config
 # Copy it as `config.toml` and adjust to your
 # needs to use Emily.
+
+[engine]
+command = "stockfish"
+# pwd = "../"
+# args = ["-v"]
+
+# Additional stockfish options
+options = { Threads = "20", Hash = "20" }

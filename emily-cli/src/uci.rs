@@ -4,7 +4,7 @@ use std::process::{self, Child, Stdio};
 
 use color_eyre::eyre::{Context, OptionExt};
 use color_eyre::Result;
-use tracing::info;
+use tracing::{debug, info, warn};
 
 use self::proto::Protocol;
 
@@ -22,18 +22,34 @@ impl Drop for Engine {
 }
 
 impl Engine {
+    fn configure(&mut self, config: crate::config::Engine) -> Result<()> {
+        self.proto.debug(config.debug)?;
+
+        for (option, value) in config.options {
+            if let Err(err) = self.proto.set_option(option, value) {
+                warn!(
+                    engine = self.proto.name(),
+                    "While setting engine option: {err}"
+                );
+            }
+        }
+
+        debug!(engine = self.proto.name(), "Engine configured");
+        Ok(())
+    }
+
     pub fn run(config: crate::config::Engine) -> Result<Engine> {
         info!(cmd = ?config.command, args = ?config.args, pwd = ?config.pwd, "Starting engine");
 
-        let mut command = process::Command::new(config.command);
+        let mut command = process::Command::new(&config.command);
 
         command
-            .args(config.args)
+            .args(&config.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
 
-        if let Some(pwd) = config.pwd {
+        if let Some(pwd) = &config.pwd {
             command.current_dir(pwd);
         }
 
@@ -65,6 +81,7 @@ impl Engine {
 
         info!(pid = engine.process.id(), "Engine started");
         engine.proto.init()?;
+        engine.configure(config)?;
 
         Ok(engine)
     }
