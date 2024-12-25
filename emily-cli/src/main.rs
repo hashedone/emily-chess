@@ -1,11 +1,14 @@
 use std::path::{Path, PathBuf};
 
 use color_eyre::Result;
-use serde::Deserialize;
 use structopt::StructOpt;
 use tracing::{debug, error, warn};
 
+use config::Config;
+
+mod config;
 mod rev;
+mod uci;
 
 #[derive(Debug, StructOpt)]
 #[structopt(name = "emily-cli", about = "Chess assistant application")]
@@ -34,14 +37,11 @@ impl Command {
     }
 }
 
-#[derive(Debug, Deserialize, Default)]
-struct Config;
-
 fn read_config(path: &Path) -> Config {
     let config = match std::fs::read_to_string(path) {
         Err(err) => {
             warn!(?err, ?path, "Error while reading config, using defaults");
-            return Config;
+            return Config::default();
         }
         Ok(config) => config,
     };
@@ -49,7 +49,7 @@ fn read_config(path: &Path) -> Config {
     match toml::from_str(&config) {
         Err(err) => {
             error!(?err, ?path, "Error parsing config, using defaults");
-            Config
+            Config::default()
         }
         Ok(config) => config,
     }
