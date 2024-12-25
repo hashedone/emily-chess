@@ -1,32 +1,35 @@
 //! UCI protocol implementation and engine interface
 
-use std::process::{self, Child, Stdio};
+use std::process::Stdio;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process;
 
 use color_eyre::eyre::{Context, OptionExt};
 use color_eyre::Result;
-use tracing::{debug, info, warn};
+use tokio::spawn;
+use tracing::{error, info, warn};
 
 use self::proto::Protocol;
 
 mod proto;
 
 pub struct Engine {
-    process: Child,
+    task: tokio::task::JoinHandle<()>,
     proto: Protocol,
 }
 
 impl Drop for Engine {
     fn drop(&mut self) {
-        self.process.kill().ok();
+        self.task.abort();
     }
 }
 
 impl Engine {
-    fn configure(&mut self, config: crate::config::Engine) -> Result<()> {
-        self.proto.debug(config.debug)?;
+    async fn configure(&mut self, config: crate::config::Engine) -> Result<()> {
+        self.proto.debug(config.debug).await?;
 
         for (option, value) in config.options {
-            if let Err(err) = self.proto.set_option(option, value) {
+            if let Err(err) = self.proto.set_option(option, value).await {
                 warn!(
                     engine = self.proto.name(),
                     "While setting engine option: {err}"
@@ -34,11 +37,11 @@ impl Engine {
             }
         }
 
-        debug!(engine = self.proto.name(), "Engine configured");
+        info!(engine = self.proto.name(), "Engine configured");
         Ok(())
     }
 
-    pub fn run(config: crate::config::Engine) -> Result<Engine> {
+    pub async fn run(config: crate::config::Engine) -> Result<Engine> {
         info!(cmd = ?config.command, args = ?config.args, pwd = ?config.pwd, "Starting engine");
 
         let mut command = process::Command::new(&config.command);
@@ -47,7 +50,8 @@ impl Engine {
             .args(&config.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
 
         if let Some(pwd) = &config.pwd {
             command.current_dir(pwd);
@@ -55,33 +59,52 @@ impl Engine {
 
         let mut process = command.spawn().wrap_err("While starting engine")?;
 
-        let io = || -> Result<_> {
-            let stdin = process
-                .stdin
-                .take()
-                .ok_or_eyre("Cannot open engine stdin")?;
-            let stdout = process
-                .stdout
-                .take()
-                .ok_or_eyre("Cannot open engine stdout")?;
+        let stdin = process
+            .stdin
+            .take()
+            .ok_or_eyre("Cannot open engine stdin")?;
+        let stdout = process
+            .stdout
+            .take()
+            .ok_or_eyre("Cannot open engine stdout")?;
 
-            Ok((stdin, stdout))
-        }();
-
-        let mut engine = match io {
-            Ok((stdin, stdout)) => Engine {
-                process,
-                proto: Protocol::new(stdin, stdout),
-            },
-            Err(err) => {
-                process.kill().ok();
-                return Err(err);
+        match process.stderr.take() {
+            Some(stderr) => {
+                spawn(async move {
+                    let mut stderr = BufReader::new(stderr).lines();
+                    loop {
+                        match stderr.next_line().await {
+                            Err(err) => {
+                                error!("While reading from engine stderr: {err}");
+                                break;
+                            }
+                            Ok(None) => break,
+                            Ok(Some(line)) => {
+                                warn!("Engine: {line}")
+                            }
+                        }
+                    }
+                });
             }
-        };
+            None => warn!("Cannot open engine stderr"),
+        }
+        info!(pid = process.id(), "Engine started");
 
-        info!(pid = engine.process.id(), "Engine started");
-        engine.proto.init()?;
-        engine.configure(config)?;
+        let proto = Protocol::new(stdin, stdout);
+
+        let task = spawn(async move {
+            match process.wait().await {
+                Ok(code) => info!("Engine exited with code {code}"),
+                Err(err) => error!("While running engine: {err}"),
+            }
+        });
+
+        let mut engine = Self { task, proto };
+
+        engine.proto.init().await?;
+        info!(engine = engine.proto.name(), "Engine initialized");
+
+        engine.configure(config).await?;
 
         Ok(engine)
     }

@@ -12,11 +12,11 @@ pub struct Rev {}
 
 impl Rev {
     #[instrument(skip(self, config), err)]
-    pub fn run(self, config: Config) -> Result<()> {
+    pub async fn run(self, config: Config) -> Result<()> {
         debug!(?self, "Position review");
 
         let engine = config.engine.ok_or_eyre("No engine configuration")?;
-        let _engine = Engine::run(engine)?;
+        let _engine = Engine::run(engine).await?;
         Ok(())
     }
 }

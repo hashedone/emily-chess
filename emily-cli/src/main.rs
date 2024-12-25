@@ -28,17 +28,17 @@ enum Command {
 }
 
 impl Command {
-    fn run(self, config: Config) -> Result<()> {
+    async fn run(self, config: Config) -> Result<()> {
         use Command::*;
 
         match self {
-            Rev(rev) => rev.run(config),
+            Rev(rev) => rev.run(config).await,
         }
     }
 }
 
-fn read_config(path: &Path) -> Config {
-    let config = match std::fs::read_to_string(path) {
+async fn read_config(path: &Path) -> Config {
+    let config = match tokio::fs::read_to_string(path).await {
         Err(err) => {
             warn!(?err, ?path, "Error while reading config, using defaults");
             return Config::default();
@@ -55,16 +55,16 @@ fn read_config(path: &Path) -> Config {
     }
 }
 
-fn main() -> Result<()> {
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<()> {
+    color_eyre::install()?;
     tracing_subscriber::fmt::init();
 
     let opt = Opt::from_args();
     debug!(?opt, "Emily CLI started");
 
-    let config = read_config(&opt.config);
+    let config = read_config(&opt.config).await;
     debug!(?config, "Emily config loaded");
 
-    opt.cmd.run(config)?;
-
-    Ok(())
+    opt.cmd.run(config).await
 }

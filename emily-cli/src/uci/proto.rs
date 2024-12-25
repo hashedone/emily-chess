@@ -1,15 +1,14 @@
 use std::fmt::Display;
-use std::io::{BufRead, BufReader, Write};
-use std::process::{ChildStdin, ChildStdout};
 
-use color_eyre::eyre::Context;
+use color_eyre::eyre::{Context, OptionExt};
 use color_eyre::Result;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::process::{ChildStdin, ChildStdout};
 use tracing::debug;
 
 pub struct Protocol {
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
-    buf: String,
+    stdout: Lines<BufReader<ChildStdout>>,
     name: String,
 }
 
@@ -17,41 +16,39 @@ impl Protocol {
     pub fn new(stdin: ChildStdin, stdout: ChildStdout) -> Self {
         Self {
             stdin,
-            stdout: BufReader::new(stdout),
-            buf: String::new(),
+            stdout: BufReader::new(stdout).lines(),
             name: String::new(),
         }
     }
 
-    fn send(&mut self, command: Command) -> Result<()> {
-        let command = command.to_string();
-        debug!(engine = self.name, "UCI send: {}", command);
+    async fn send(&mut self, command: Command) -> Result<()> {
+        let mut command = command.to_string();
+        command.push('\n');
 
         self.stdin
             .write_all(command.as_bytes())
+            .await
             .wrap_err("While writting to engine")?;
 
-        self.stdin
-            .write_all(b"\n")
-            .wrap_err("While writting to engine")
+        debug!(engine = self.name, "UCI send: {}", command.trim());
+        Ok(())
     }
 
-    fn recv(&mut self) -> Result<Msg> {
+    async fn recv(&mut self) -> Result<Msg> {
         loop {
-            self.stdout
-                .read_line(&mut self.buf)
-                .wrap_err("While reading engine")?;
+            let line = self
+                .stdout
+                .next_line()
+                .await
+                .wrap_err("While reading engine")?
+                .ok_or_eyre("Engine stdout closed")?;
 
-            let line = self.buf.trim();
+            let line = line.trim();
             if !line.is_empty() {
                 debug!(engine = self.name, "UCI recv: {}", line);
-            }
-
-            let msg = Msg::parse(line);
-            self.buf.clear();
-
-            if let Some(msg) = msg {
-                return Ok(msg);
+                if let Some(msg) = Msg::parse(line) {
+                    return Ok(msg);
+                }
             }
         }
     }
@@ -60,33 +57,30 @@ impl Protocol {
         &self.name
     }
 
-    pub fn init(&mut self) -> Result<Headers> {
-        self.send(Command::Uci)?;
+    pub async fn init(&mut self) -> Result<()> {
+        self.send(Command::Uci).await?;
 
         loop {
             use Msg::*;
 
-            match self.recv()? {
+            match self.recv().await? {
                 Id { name: Some(n), .. } => self.name = n,
                 UciOk => break,
                 _ => (),
             }
         }
 
-        Ok(Headers)
+        Ok(())
     }
 
-    pub fn debug(&mut self, debug: bool) -> Result<()> {
-        self.send(Command::Debug(debug))
+    pub async fn debug(&mut self, debug: bool) -> Result<()> {
+        self.send(Command::Debug(debug)).await
     }
 
-    pub fn set_option(&mut self, option: String, value: String) -> Result<()> {
-        self.send(Command::SetOption(option, value))
+    pub async fn set_option(&mut self, option: String, value: String) -> Result<()> {
+        self.send(Command::SetOption(option, value)).await
     }
 }
-
-#[derive(Debug)]
-pub struct Headers;
 
 #[derive(Debug)]
 enum Command {
