@@ -6,8 +6,9 @@ edition = "2021"
 [dependencies]
 color-eyre = "0.6.3"
 serde = { version = "1.0.214", features = ["derive"] }
+shakmaty = "0.27.2"
 structopt = { version = "0.3.26", features = ["paw", "color", "suggestions", "doc"] }
-tokio = { version = "1.42.0", features = ["macros", "rt", "io-util", "fs", "parking_lot", "process"] }
+tokio = { version = "1.42.0", features = ["macros", "rt", "io-util", "fs", "parking_lot", "process", "sync"] }
 toml = { version = "0.8.19", features = ["parse"] }
 tracing = "0.1.40"
 tracing-error = { version = "0.2.0", features = ["traced-error"] }

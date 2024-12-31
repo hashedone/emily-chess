@@ -1,15 +1,20 @@
 //! UCI protocol implementation and engine interface
 
+use shakmaty::fen::Fen;
+use shakmaty::uci::UciMove;
 use std::process::Stdio;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process;
 
 use color_eyre::eyre::{Context, OptionExt};
 use color_eyre::Result;
 use tokio::spawn;
-use tracing::{error, info, warn};
+use tracing::{error, info, instrument, warn};
 
-use self::proto::Protocol;
+use self::proto::{InfoStream, Protocol};
+
+pub use self::proto::Score;
 
 mod proto;
 
@@ -26,14 +31,13 @@ impl Drop for Engine {
 
 impl Engine {
     async fn configure(&mut self, config: crate::config::Engine) -> Result<()> {
-        self.proto.debug(config.debug).await?;
+        if config.debug {
+            self.proto.debug().await?;
+        }
 
         for (option, value) in config.options {
             if let Err(err) = self.proto.set_option(option, value).await {
-                warn!(
-                    engine = self.proto.name(),
-                    "While setting engine option: {err}"
-                );
+                warn!("While setting engine option: {err}");
             }
         }
 
@@ -41,6 +45,7 @@ impl Engine {
         Ok(())
     }
 
+    #[instrument(err)]
     pub async fn run(config: crate::config::Engine) -> Result<Engine> {
         info!(cmd = ?config.command, args = ?config.args, pwd = ?config.pwd, "Starting engine");
 
@@ -107,5 +112,27 @@ impl Engine {
         engine.configure(config).await?;
 
         Ok(engine)
+    }
+
+    #[instrument(skip_all, err)]
+    pub async fn new_game(&mut self) -> Result<()> {
+        self.proto.new_game().await?;
+        self.proto.wait_ready().await
+    }
+
+    #[instrument(skip_all, fields(%fen, ?depth, ?time), err)]
+    pub async fn go(
+        &mut self,
+        fen: Fen,
+        depth: Option<u8>,
+        time: Option<Duration>,
+    ) -> Result<InfoStream> {
+        self.proto.position(fen, []).await?;
+        self.proto.go(depth, time).await
+    }
+
+    #[instrument(skip_all, err)]
+    pub async fn quit(mut self) -> Result<()> {
+        self.proto.quit().await
     }
 }

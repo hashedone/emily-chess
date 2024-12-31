@@ -7,6 +7,7 @@ use tracing::{debug, error, warn};
 use config::Config;
 
 mod config;
+mod knowledge;
 mod rev;
 mod uci;
 
