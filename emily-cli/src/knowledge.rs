@@ -112,8 +112,14 @@ impl PosInfo {
         }
     }
 
+    /// Returns outcome in this position
     pub fn outcome(&self) -> Option<&Outcome> {
         self.outcome.as_ref()
+    }
+
+    /// Gets the engine evaluation
+    pub fn eval(&self) -> Option<&Score> {
+        self.eval.as_ref()
     }
 
     /// Updates engine evaluation
