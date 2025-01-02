@@ -1,7 +1,7 @@
 //! UCI protocol implementation and engine interface
 
 use shakmaty::fen::Fen;
-use shakmaty::uci::UciMove;
+use shakmaty::{Chess, EnPassantMode};
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -11,6 +11,8 @@ use color_eyre::eyre::{Context, OptionExt};
 use color_eyre::Result;
 use tokio::spawn;
 use tracing::{error, info, instrument, warn};
+
+use crate::adapters::TracingAdapt;
 
 use self::proto::{InfoStream, Protocol};
 
@@ -120,13 +122,14 @@ impl Engine {
         self.proto.wait_ready().await
     }
 
-    #[instrument(skip_all, fields(%fen, ?depth, ?time), err)]
+    #[instrument(skip_all, fields(fen = fen.tr(), ?depth, ?time), err)]
     pub async fn go(
         &mut self,
-        fen: Fen,
+        fen: Chess,
         depth: Option<u8>,
         time: Option<Duration>,
     ) -> Result<InfoStream> {
+        let fen = Fen::from_position(fen, EnPassantMode::Always);
         self.proto.position(fen, []).await?;
         self.proto.go(depth, time).await
     }

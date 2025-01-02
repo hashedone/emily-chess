@@ -430,7 +430,7 @@ impl Info {
 }
 
 /// Engine score evaluation
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Score {
     /// Centipawns score (from the engine PoV)
     Cp(i16),

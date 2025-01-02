@@ -6,6 +6,7 @@ use tracing::{debug, error, warn};
 
 use config::Config;
 
+mod adapters;
 mod config;
 mod knowledge;
 mod rev;

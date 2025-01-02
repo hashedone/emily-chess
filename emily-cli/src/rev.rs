@@ -1,15 +1,16 @@
+use std::path::PathBuf;
 use std::time::Duration;
 
 use color_eyre::eyre::OptionExt;
-use shakmaty::fen::Fen;
-use shakmaty::uci::UciMove;
-use shakmaty::{CastlingMode, Chess, Color, EnPassantMode, Position, Setup};
+use shakmaty::{Chess, Color, Move, Position};
 use structopt::StructOpt;
+use tokio::fs::File;
 use tokio::spawn;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::task::JoinHandle;
-use tracing::{debug, info, instrument, Level};
+use tracing::{debug, error, info, instrument};
 
+use crate::adapters::TracingAdapt;
 use crate::knowledge::Knowledge;
 use crate::uci::{Engine, Score};
 use crate::{config, Config};
@@ -17,7 +18,11 @@ use color_eyre::Result;
 
 /// Game review parameters
 #[derive(Debug, StructOpt)]
-pub struct Rev {}
+pub struct Rev {
+    /// Output PGN file
+    #[structopt(short, long)]
+    output: PathBuf,
+}
 
 impl Rev {
     #[instrument(skip(self, config), err)]
@@ -30,40 +35,43 @@ impl Rev {
         )
         .await?;
 
-        let fen = Fen::from_setup(Setup::initial());
-        info!("Analyzing position: {fen}");
+        let root = Chess::new();
+        info!(pos = %root.tr(), "Analyzing position");
 
-        let _knowledge = Knowledge::new(fen.clone());
+        let mut knowledge = Knowledge::new(root.clone());
         let (task, fen_tx, mut res_rx) = engine.spawn()?;
 
-        fen_tx.send(fen).await?;
+        fen_tx.send(root).await?;
         let mut total_moves = 1;
         let mut pending = 1;
 
         while let Some(res) = res_rx.recv().await {
             pending -= 1;
 
-            let mut board: Chess = res.fen.clone().into_position(CastlingMode::Standard)?;
-            let mov = res.mov.to_move(&board)?;
-            let score = match board.turn() {
+            let eval = match res.fen.turn() {
                 Color::White => res.eval,
                 Color::Black => res.eval.rev(),
             };
 
             info!(
-                fen = %res.fen,
+                fen = res.fen.tr(),
                 mov = %res.mov,
-                eval = ?score,
+                %eval,
                 pending,
                 total = total_moves,
                 "Move analysed"
             );
 
-            board.play_unchecked(&mov);
+            knowledge.pos_mut(res.fen.clone()).update_eval(eval);
+            let next_fen = knowledge
+                .mov_mut(res.fen.clone(), res.mov)?
+                .position()
+                .clone();
+            let next = knowledge.pos_mut(next_fen.clone());
+            next.update_eval(eval);
 
-            if !board.is_game_over() {
-                let fen = Fen::from_position(board, EnPassantMode::Always);
-                fen_tx.send(fen).await?;
+            if next.outcome().is_none() {
+                fen_tx.send(next_fen).await?;
                 total_moves += 1;
                 pending += 1;
             }
@@ -74,10 +82,27 @@ impl Rev {
         }
 
         drop(fen_tx);
-        let engine = task.await??;
 
-        info!("Engine completed");
-        engine.quit().await
+        spawn(async move {
+            let res = async move {
+                let engine = task.await??;
+
+                info!("Engine completed");
+                engine.quit().await
+            }
+            .await;
+
+            if let Err(err) = res {
+                error!(?err, "Engine teardown failed");
+            }
+        });
+
+        let mut output = File::create(&self.output).await?;
+        knowledge.pgn()?.write_pgn(&mut output).await?;
+
+        info!(file = ?self.output, "PGN stored");
+
+        Ok(())
     }
 }
 
@@ -85,9 +110,9 @@ impl Rev {
 #[derive(Debug)]
 struct EngineAnalysis {
     /// Analysed position
-    fen: Fen,
+    fen: Chess,
     /// Choosen move
-    mov: UciMove,
+    mov: Move,
     /// Engine evaluation
     eval: Score,
 }
@@ -115,8 +140,8 @@ impl EngineProcessor {
         })
     }
 
-    fn spawn(mut self) -> Result<(EngineTask, Sender<Fen>, Receiver<EngineAnalysis>)> {
-        let (fen_tx, mut fen_rx) = mpsc::channel::<Fen>(10);
+    fn spawn(mut self) -> Result<(EngineTask, Sender<Chess>, Receiver<EngineAnalysis>)> {
+        let (fen_tx, mut fen_rx) = mpsc::channel::<Chess>(10);
         let (res_tx, res_rx) = mpsc::channel::<EngineAnalysis>(2);
 
         let task = spawn(async move {
@@ -133,9 +158,9 @@ impl EngineProcessor {
         Ok((task, fen_tx, res_rx))
     }
 
-    #[instrument(skip_all, fields(engine=%self.name, fen=%fen), err)]
-    async fn process(&mut self, fen: Fen) -> Result<(UciMove, Score)> {
-        let mut stream = self.engine.go(fen, self.depth, self.time).await?;
+    #[instrument(skip_all, fields(engine=%self.name, fen=fen.tr()), err)]
+    async fn process(&mut self, fen: Chess) -> Result<(Move, Score)> {
+        let mut stream = self.engine.go(fen.clone(), self.depth, self.time).await?;
 
         let mut mov = None;
         let mut eval = None;
@@ -146,6 +171,7 @@ impl EngineProcessor {
         }
 
         let mov = mov.ok_or_eyre("No move after analysis")?;
+        let mov = mov.to_move(&fen)?;
         let eval = eval.ok_or_eyre("No eval after analyis")?;
 
         debug!(%mov, %eval, "Position processed");
