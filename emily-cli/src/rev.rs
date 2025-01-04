@@ -68,9 +68,9 @@ impl Rev {
                 .position()
                 .clone();
             let next = knowledge.pos_mut(next_fen.clone());
-            next.update_eval(eval);
 
             if next.outcome().is_none() && next.eval().is_none() {
+                next.update_eval(eval);
                 fen_tx.send(next_fen).await?;
                 total_moves += 1;
                 pending += 1;
