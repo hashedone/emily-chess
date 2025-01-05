@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use color_eyre::eyre::OptionExt;
-use shakmaty::{Chess, Move, Outcome, Position};
+use shakmaty::{Chess, Move, Position};
 use tracing::{info, instrument, warn};
 
 use crate::adapters::TracingAdapt;
@@ -64,7 +64,6 @@ impl Knowledge {
 
         if !pos.moves.contains_key(&mov) {
             let new_pos = fen.clone().play(&mov)?;
-            let outcome = new_pos.outcome();
 
             let info = MoveInfo::new(new_pos.clone())?;
             tracing::Span::current().record("new_pos", new_pos.tr());
@@ -74,7 +73,7 @@ impl Knowledge {
 
             self.data.entry(new_pos.clone()).or_insert_with(|| {
                 info!("Adding new position");
-                PosInfo::new(outcome)
+                PosInfo::new()
             });
         };
 
@@ -99,22 +98,12 @@ pub struct PosInfo {
     moves: HashMap<Move, MoveInfo>,
     /// Engine evaluation of the position.
     eval: Option<Score>,
-    /// Game outcome.
-    outcome: Option<Outcome>,
 }
 
 impl PosInfo {
     /// Creates new position from history and one move played from there
-    fn new(outcome: Option<Outcome>) -> Self {
-        Self {
-            outcome,
-            ..Default::default()
-        }
-    }
-
-    /// Returns outcome in this position
-    pub fn outcome(&self) -> Option<&Outcome> {
-        self.outcome.as_ref()
+    fn new() -> Self {
+        Self::default()
     }
 
     /// Gets the engine evaluation
