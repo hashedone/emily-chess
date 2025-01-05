@@ -15,4 +15,4 @@ tokio = { version = "1.42.0", features = ["macros", "rt", "io-util", "fs", "park
 toml = { version = "0.8.19", features = ["parse"] }
 tracing = "0.1.40"
 tracing-error = { version = "0.2.0", features = ["traced-error"] }
-tracing-subscriber = "0.3.18"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }

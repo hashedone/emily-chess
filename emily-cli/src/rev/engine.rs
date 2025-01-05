@@ -5,7 +5,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use color_eyre::eyre::OptionExt;
 use shakmaty::{Chess, Color, Move, Position};
-use tracing::{debug, info, instrument};
+use tracing::{debug, instrument};
 
 use crate::adapters::TracingAdapt;
 use crate::knowledge::Knowledge;
@@ -43,7 +43,7 @@ impl EngineAnalysis {
 impl ProcessingResult for EngineAnalysis {
     #[instrument(skip_all, fields(fen=%self.fen.tr(), mov=%self.mov, eval=%self.eval))]
     fn apply(&self, knowledge: &mut Knowledge) -> Result<Vec<Chess>> {
-        info!(eval=%self.eval, "Move analysed");
+        debug!(eval=%self.eval, "Move analysed");
         knowledge.pos_mut(self.fen.clone()).update_eval(self.eval);
 
         let next_fen = knowledge

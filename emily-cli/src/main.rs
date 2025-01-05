@@ -57,10 +57,28 @@ async fn read_config(path: &Path) -> Config {
     }
 }
 
+fn setup_tracing() {
+    use tracing_error::ErrorLayer;
+    use tracing_subscriber::filter::EnvFilter;
+    use tracing_subscriber::fmt;
+    use tracing_subscriber::prelude::*;
+
+    let fmt_layer = fmt::layer().with_target(false).pretty();
+    let filter_layer = EnvFilter::try_from_default_env()
+        .or_else(|_| EnvFilter::try_new("info"))
+        .unwrap();
+
+    tracing_subscriber::registry()
+        .with(filter_layer)
+        .with(fmt_layer)
+        .with(ErrorLayer::default())
+        .init();
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
+    setup_tracing();
     color_eyre::install()?;
-    tracing_subscriber::fmt::init();
 
     let opt = Opt::from_args();
     debug!(?opt, "Emily CLI started");
