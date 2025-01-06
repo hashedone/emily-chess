@@ -92,6 +92,7 @@ impl Engine {
         self.engine.quit().await
     }
 
+    /// Processes a single position
     #[instrument(skip_all, fields(engine=%self.name, fen=fen.tr()), err)]
     async fn process(&mut self, fen: Chess) -> Result<EngineAnalysis> {
         let mut stream = self.engine.go(fen.clone(), self.depth, self.time).await?;

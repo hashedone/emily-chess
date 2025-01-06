@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use color_eyre::eyre::{bail, Context, OptionExt};
 use color_eyre::Result;
+use serde::{Deserialize, Serialize};
 use shakmaty::fen::Fen;
 use shakmaty::uci::UciMove;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
@@ -344,11 +345,13 @@ pub struct Info {
     /// Line number (1 - best, 2 - second the best, ...). If not send (single-line mode) it will be
     /// defaulted to 1.
     #[allow(unused)]
-    pub multipv: u16,
+    pub multipv: u8,
     /// Engine evaluation
     pub score: Score,
     /// The engine line (`pv`)
     pub line: Vec<UciMove>,
+    /// Actuall depth the calculation reached
+    pub depth: u8,
 }
 
 impl Info {
@@ -371,6 +374,7 @@ impl Info {
         let mut args = args.split_whitespace().peekable();
 
         let mut multipv = 1;
+        let mut depth = 0;
         let mut score = None;
         let mut line = vec![];
 
@@ -405,6 +409,13 @@ impl Info {
                     };
                     score = Some(sc);
                 }
+                "depth" => {
+                    depth = args
+                        .next()
+                        .ok_or_eyre("Missing depth value")?
+                        .parse()
+                        .wrap_err("Invalid depth value")?;
+                }
                 "pv" => {
                     line.clear();
                     while let Some(mv) = args.peek().and_then(|m| m.parse().ok()) {
@@ -425,12 +436,13 @@ impl Info {
             multipv,
             score,
             line,
+            depth,
         }))
     }
 }
 
 /// Engine score evaluation
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize, Deserialize)]
 pub enum Score {
     /// Centipawns score (from the engine PoV)
     Cp(i16),
