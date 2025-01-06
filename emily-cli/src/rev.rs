@@ -1,7 +1,8 @@
 use std::path::PathBuf;
 
 use color_eyre::eyre::OptionExt;
-use shakmaty::Chess;
+use shakmaty::fen::Fen;
+use shakmaty::{CastlingMode, Chess};
 use structopt::StructOpt;
 use tokio::fs::File;
 use tokio::spawn;
@@ -18,12 +19,21 @@ mod dispatcher;
 mod engine;
 mod processor;
 
+fn parse_chess(fen: &str) -> Result<Chess> {
+    let fen: Fen = fen.parse()?;
+    let fen: Chess = fen.into_position(CastlingMode::Standard)?;
+    Ok(fen)
+}
+
 /// Game review parameters
 #[derive(Debug, StructOpt)]
 pub struct Rev {
     /// Output PGN file
     #[structopt(short, long)]
     output: PathBuf,
+    /// Starting position
+    #[structopt(short, long, parse(try_from_str = parse_chess))]
+    fen: Option<Chess>,
 }
 
 impl Rev {
@@ -37,7 +47,7 @@ impl Rev {
         )
         .await?;
 
-        let root = Chess::new();
+        let root = self.fen.unwrap_or_default();
         info!(pos = %root.tr(), "Analyzing position");
 
         let mut knowledge = Knowledge::new(root.clone());
