@@ -55,7 +55,7 @@ impl Rev {
         let mut dispatcher = Dispatcher::builder();
         dispatcher.with(engine.new_game().await?);
         let dispatcher = dispatcher.build();
-        dispatcher.dispatch(&mut knowledge, root).await?;
+        dispatcher.dispatch(&mut knowledge, 0, 0).await?;
 
         spawn(async move {
             if let Err(err) = engine.quit().await {
@@ -64,7 +64,7 @@ impl Rev {
         });
 
         let mut output = File::create(&self.output).await?;
-        knowledge.pgn()?.write_pgn(&mut output).await?;
+        knowledge.pgn().write_pgn(&mut output).await?;
 
         info!(file = ?self.output, "PGN stored");
 

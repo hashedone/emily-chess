@@ -1,34 +1,42 @@
 //! The traits for a position processors
 
 use async_trait::async_trait;
-use shakmaty::Chess;
 
 use crate::knowledge::Knowledge;
-use crate::Result;
 
-pub type BoxedResult = Box<dyn ProcessingResult + 'static>;
+/// Variation to be scheduled for processing
+#[derive(Debug, Clone)]
+pub struct Scheduled {
+    /// Variation to add a move to
+    pub variation: usize,
+    /// Halfmoves where to process variation
+    pub hm: usize,
+}
 
-/// Trait for anything that can be returned as processing result.
-pub trait ProcessingResult {
-    /// Applies the result to the knowledge base and returns further positions to be analysed
-    fn apply(&self, knowledge: &mut Knowledge) -> Result<Vec<Chess>>;
+impl Scheduled {
+    pub fn new(variation: usize, hm: usize) -> Self {
+        Self { variation, hm }
+    }
 }
 
 /// Entity processing prositions
 #[async_trait]
 pub trait Processor {
-    /// Cheks if the position should be processed.
-    fn should_process(&mut self, knowledge: &mut Knowledge, fen: &Chess) -> Result<bool>;
+    /// Adds variations to be processed to internal queue. It is allowed to skip transactions that
+    /// are not relevant or already processed. If the variation can be processed in-place (without
+    /// blocking), it can also be processed immediately instead of enqueing.
+    ///
+    /// Passed variations are never the concluded games (ie. `Variation::outcome` is always
+    /// `None`).
+    fn enqueue(&mut self, knowledge: &mut Knowledge, schedule: &[Scheduled]);
 
-    /// Processes single position
-    ///
-    /// The knowledge can be used to determine if the move should be processed (eg. if it was
-    /// already processed by this processor - the dispatcher would not perform any cycle detection,
-    /// but the final positions are never send to be processed) and/or perform a processing
-    /// preparation on the move.
-    ///
-    /// The function returns a future that completes when move analysis is ready and returns a
-    /// boxed `ProcessorResult` on which the `apply` method would be called to update the
-    /// knowledge.
-    async fn process(&mut self, fen: Chess) -> Result<BoxedResult>;
+    /// Processes single position stored internally. The processing result should also be stored
+    /// and will be applied later.
+    async fn process(&mut self);
+
+    /// Applies results accumulated so far. Returns moves to further analyse
+    fn apply_results(&mut self, knowledge: &mut Knowledge) -> Vec<Scheduled>;
+
+    /// Returns if the processor has work to do
+    fn is_idle(&self) -> bool;
 }

@@ -1,30 +1,14 @@
-use std::collections::{HashMap, VecDeque};
-use std::fmt::Display;
 use std::num::NonZeroU32;
 
 use chrono::Local;
 use shakmaty::fen::Fen;
 use shakmaty::san::San;
-use shakmaty::{Chess, Color, EnPassantMode, Move, Outcome, Position};
+use shakmaty::{Chess, Color, EnPassantMode, Outcome, Position};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
-use tracing::{debug, instrument, warn};
+use tracing::{debug, instrument};
 
-use crate::adapters::TracingAdapt;
-use crate::uci::Score;
-
-use super::Knowledge;
+use super::{Knowledge, MoveInfo, PosInfo, Variation};
 use crate::Result;
-
-/// [Knowledge] preprocessed for `PGN` storage
-#[derive(Debug)]
-pub struct Pgn {
-    /// Starting position
-    root: Chess,
-    /// Game outcome
-    outcome: Option<Outcome>,
-    /// Positions in game
-    data: HashMap<Chess, PosInfo>,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MoveNo(NonZeroU32, Color);
@@ -47,6 +31,136 @@ impl MoveNo {
 impl PartialOrd for MoveNo {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
+    }
+}
+
+/// A single PGN move
+#[derive(Debug, Clone)]
+struct Mov<'a> {
+    /// Move played
+    mov: San,
+    /// Move number
+    no: MoveNo,
+    /// Information the played move
+    #[allow(unused)]
+    movinfo: Option<&'a MoveInfo>,
+    /// Information about the position after the move played
+    posinfo: &'a PosInfo,
+}
+
+impl Mov<'_> {
+    async fn write_comment<W: AsyncWrite + Unpin>(&self, writer: &mut W) -> Result<()> {
+        writer.write_all(b" { ").await?;
+        if let Some(eval) = self.posinfo.eval {
+            writer.write_all(b"Eval: ").await?;
+            writer.write_all(eval.to_string().as_bytes()).await?;
+            writer.write_all(b", ").await?;
+        }
+        writer.write_all(b"}\n").await?;
+
+        Ok(())
+    }
+
+    async fn write<W: AsyncWrite + Unpin>(&self, writer: &mut W) -> Result<()> {
+        writer.write_all(self.no.to_string().as_bytes()).await?;
+        writer.write_all(b" ").await?;
+        writer.write_all(self.mov.to_string().as_bytes()).await?;
+        self.write_comment(writer).await
+    }
+}
+
+/// Single PGN node. Node is a line up until first branch followed by all the possible moves in
+/// branching.
+#[derive(Debug, Clone)]
+struct Node<'a> {
+    /// Moves up until first branch
+    line: Vec<Mov<'a>>,
+    /// Branching options
+    branches: Vec<Node<'a>>,
+    /// Main line outcome of this node
+    outcome: Option<Outcome>,
+}
+
+impl Node<'_> {
+    async fn write_line<W: AsyncWrite + Unpin>(&self, writer: &mut W) -> Result<()> {
+        for mov in &self.line {
+            mov.write(writer).await?;
+        }
+
+        Ok(())
+    }
+}
+
+impl<'a> Node<'a> {
+    /// Adds `mov` move to the node after the `hm` move. Returns node it was added to (can change
+    /// if branch was created) and `hm` of the new move in returned node.
+    ///
+    /// Assumes there is at least one move on the line.
+    fn add_move(
+        &mut self,
+        hm: usize,
+        mov: San,
+        movinfo: Option<&'a MoveInfo>,
+        posinfo: &'a PosInfo,
+    ) -> (&mut Self, usize) {
+        if hm == self.line.len() && self.branches.is_empty() {
+            // Adding a move to the variation
+            self.line.push(Mov {
+                mov,
+                no: self.line[hm - 1].no.next(),
+                movinfo,
+                posinfo,
+            });
+            (self, hm + 1)
+        } else if hm == self.line.len() {
+            // Branching point reached. Looking for variation to follow, or adding
+            // new variation.
+            match self
+                .branches
+                .iter_mut()
+                .position(|branch| branch.line[0].mov == mov)
+            {
+                // Following the branch
+                Some(idx) => (&mut self.branches[idx], 1),
+                None => {
+                    // Adding the new branch
+                    self.branches.push(Node {
+                        line: vec![Mov {
+                            mov,
+                            no: self.line[hm - 1].no.next(),
+                            movinfo,
+                            posinfo,
+                        }],
+                        branches: vec![],
+                        outcome: None,
+                    });
+                    (self.branches.last_mut().unwrap(), 1)
+                }
+            }
+        } else if self.line[hm].mov == mov {
+            // Following the main line
+            (self, hm + 1)
+        } else {
+            // Creating branching point
+            self.branches.push(Node {
+                line: self.line.split_off(hm),
+                branches: vec![],
+                outcome: self.outcome,
+            });
+
+            self.branches.push(Node {
+                line: vec![Mov {
+                    mov,
+                    no: self.line[0].no.next(),
+                    movinfo,
+                    posinfo,
+                }],
+                branches: vec![],
+                outcome: None,
+            });
+
+            (self.branches.last_mut().unwrap(), 1)
+        }
     }
 }
 
@@ -74,103 +188,109 @@ impl std::fmt::Display for MoveNo {
     }
 }
 
-impl Pgn {
-    pub fn new(knowledge: &Knowledge) -> Result<Self> {
-        let mut queue = VecDeque::new();
-        let mut data = HashMap::new();
-        queue.push_back(knowledge.root.clone());
+/// [Knowledge] preprocessed for `PGN` storage
+#[derive(Debug)]
+pub struct Pgn<'a> {
+    /// Starting position
+    rootinfo: &'a PosInfo,
+    /// Starting node
+    line: Node<'a>,
+}
 
-        while let Some(fen) = queue.pop_front() {
-            let Some(info) = knowledge.data.get(&fen) else {
-                continue;
-            };
-
-            let info = match PosInfo::new(&fen, info) {
-                Ok(info) => info,
-                Err(err) => {
-                    warn!(?err, "Cannot convert position to PGN");
-                    continue;
-                }
-            };
-
-            for mov in &info.moves {
-                if !data.contains_key(&mov.pos) {
-                    queue.push_back(mov.pos.clone())
-                }
-            }
-
-            data.insert(fen, info);
-        }
-
-        let last = std::iter::successors(Some(&knowledge.root), |pos| {
-            data.get(pos)
-                .and_then(|info| info.moves.first())
-                .map(|mov| &mov.pos)
-        })
-        .take(data.len())
-        .last()
-        .unwrap_or(&knowledge.root);
-
-        let mut res = Self {
-            root: knowledge.root.clone(),
-            outcome: last.outcome(),
-            data,
+impl<'a> Pgn<'a> {
+    /// Orders variations
+    ///
+    /// The main line would always end up first, and will never be empty. The result would be empty
+    /// if and only if all the variations are empty
+    ///
+    /// The multi-game PGNs are not supported, and variations not strting on the same position
+    /// as the mainline would be ingnored.
+    ///
+    /// The mainline can be extended by later variation if it is its prefix.
+    fn order_variations(knowledge: &Knowledge) -> Vec<&Variation> {
+        let main = &knowledge.variations[knowledge.main];
+        let main = match main.moves.is_empty() {
+            true => knowledge
+                .variations
+                .iter()
+                .find(|variation| !variation.moves.is_empty()),
+            false => Some(main),
         };
-        res.populate_pathes();
 
-        Ok(res)
+        let Some(main) = main else { return vec![] };
+        let root = main.positions[0];
+
+        let mut variations: Vec<_> = knowledge
+            .variations
+            .iter()
+            .filter(|variation| variation.positions[0] == root)
+            .collect();
+        variations.swap(0, knowledge.main);
+
+        variations
     }
 
-    /// Calculates the cardinal path to each move
-    #[instrument(skip_all)]
-    fn populate_pathes(&mut self) {
-        match self.data.get(&self.root) {
-            None => return,
-            Some(root) if root.moves.is_empty() => return,
-            Some(_) => (),
+    /// Prepares PGN form the Knowledge
+    pub fn new(knowledge: &'a Knowledge) -> Self {
+        let variations = Self::order_variations(knowledge);
+        let mut pgn = Self {
+            rootinfo: knowledge.root(),
+            line: Node {
+                line: vec![],
+                branches: vec![],
+                outcome: None,
+            },
         };
 
-        let mut stack = vec![(self.root.clone(), 0, MoveNo::new(&self.root))];
-
-        while let Some((pos, movidx, movno)) = stack.last_mut() {
-            let Some(mut info) = self.data.get(pos).cloned() else {
-                // This should never happen
-                stack.pop();
-                continue;
-            };
-
-            // Check if the position should be maintained on the stack or not, and if so - update
-            // it for the next moveidx
-            let (pos, movidx, movno) = if *movidx + 1 < info.moves.len() {
-                *movidx += 1;
-                (pos.clone(), *movidx, *movno)
-            } else {
-                stack.pop().unwrap()
-            };
-
-            let mov = &info.moves[movidx];
-            let nextpos = &mov.pos;
-
-            // Prevent updating the root first
-            if *nextpos != self.root {
-                if let Some(nextinfo) = self.data.get_mut(nextpos) {
-                    if info.path.path.last().map(|(_, _, idx)| *idx) == Some(0) {
-                        // Last move was not branching - removing as it is not relevant
-                        info.path.path.pop();
-                    }
-                    info.path.path.push((movno, mov.mov.clone(), movidx));
-
-                    // Path is update - we will need to propagate it.
-                    if nextinfo.path.update(info.path, pos) && !nextinfo.moves.is_empty() {
-                        stack.push((nextpos.clone(), 0, movno.next()))
-                    }
-                }
-            }
+        // No moves edge case. We can safely use `Iterator::all` here as there is at least one
+        // variation by construction.
+        if variations.is_empty() {
+            return pgn;
         }
+
+        // Adding the first move immediately to satisfy `Node::add_move`
+        let main = &variations[0];
+        pgn.rootinfo = knowledge.position(main.positions[0]);
+        pgn.line.line.push(Mov {
+            mov: San::from_move(&pgn.rootinfo.pos, &main.moves[0]),
+            no: MoveNo::new(pgn.rootinfo.position()),
+            movinfo: pgn.rootinfo.moves.get(&main.moves[0]),
+            // Position after the move!
+            posinfo: knowledge.position(main.positions[1]),
+        });
+
+        for variation in variations {
+            let movinfos =
+                variation
+                    .moves
+                    .iter()
+                    .zip(&variation.positions[..])
+                    .map(|(mov, pos)| {
+                        let position = knowledge.position(*pos);
+                        let movinfo = position.moves.get(mov);
+                        let mov = San::from_move(&position.pos, mov);
+                        (mov, movinfo)
+                    });
+
+            let posinfos = variation.positions[1..]
+                .iter()
+                .map(|position| knowledge.position(*position));
+
+            let (node, _) = movinfos
+                .zip(posinfos)
+                .map(|((mov, movinfo), posinfo)| (mov, movinfo, posinfo))
+                .fold((&mut pgn.line, 0), |(node, hm), (mov, movinfo, posinfo)| {
+                    node.add_move(hm, mov, movinfo, posinfo)
+                });
+
+            node.outcome = variation.outcome;
+        }
+
+        pgn
     }
 
     async fn write_result<W: AsyncWrite + Unpin>(&self, writer: &mut W) -> Result<()> {
-        let result = match self.outcome {
+        let result = match self.line.outcome {
             Some(Outcome::Draw) => "1/2-1/2",
             Some(Outcome::Decisive {
                 winner: Color::White,
@@ -203,12 +323,12 @@ impl Pgn {
         self.write_result(writer).await?;
         writer.write_all(b"\"]\n").await?;
 
-        if self.root != Chess::new() {
+        if *self.rootinfo.position() != Chess::new() {
             writer.write_all(b"[SetUp \"1\"]").await?;
             writer.write_all(b"[FEN \"").await?;
             writer
                 .write_all(
-                    Fen::from_position(self.root.clone(), EnPassantMode::Always)
+                    Fen::from_position(self.rootinfo.position().clone(), EnPassantMode::Always)
                         .to_string()
                         .as_bytes(),
                 )
@@ -219,84 +339,43 @@ impl Pgn {
         Ok(())
     }
 
-    async fn write_comment<W: AsyncWrite + Unpin>(
-        _move_info: &MoveInfo,
-        pos_info: Option<&PosInfo>,
-        transposition: bool,
-        writer: &mut W,
-    ) -> Result<()> {
-        writer.write_all(b" { ").await?;
-        if let Some(pos_info) = pos_info {
-            if let Some(eval) = pos_info.eval {
-                writer.write_all(b"Eval: ").await?;
-                writer.write_all(eval.to_string().as_bytes()).await?;
-                writer.write_all(b", ").await?;
-            }
-
-            if transposition {
-                writer.write_all(b"Transposes: ").await?;
-                writer
-                    .write_all(pos_info.path.to_string().as_bytes())
-                    .await?;
-            }
-        }
-        writer.write_all(b"}\n").await?;
-
-        Ok(())
-    }
-
     #[instrument(skip_all)]
     async fn write_moves<W: AsyncWrite + Unpin>(&self, writer: &mut W) -> Result<()> {
-        debug!(count = self.data.len(), "Storing moves");
-        let mut stack: Vec<_> = vec![(None, self.root.clone(), 0, MoveNo::new(&self.root))];
+        debug!("Storing PGN");
+        self.line.write_line(writer).await?;
 
-        while let Some((parent, pos, mov_idx, mov_no)) = stack.last_mut() {
-            let Some(info) = self.data.get(pos) else {
-                warn!(pos = pos.tr(), "Missing position info");
-                stack.pop();
-                continue;
-            };
+        if self.line.branches.is_empty() {
+            // Flat PGN
+            return Ok(());
+        }
 
-            if info.moves.is_empty() {
-                debug!(pos = pos.tr(), "Final position, no moves to store");
+        let mut stack: Vec<_> = vec![(&self.line, 0)];
+
+        while let Some((line, branchidx)) = stack.last_mut() {
+            if *branchidx >= line.branches.len() {
+                // Visited all the branches
                 stack.pop();
+                writer.write_all(b")").await?;
                 continue;
             }
 
-            let mov = &info.moves[*mov_idx];
-
-            debug!(pos = pos.tr(), mov = %mov.mov, "Storing next move");
-            if *mov_idx > 0 {
-                debug!("New variation");
-                // Starting new variation
+            if *branchidx > 0 {
+                // Opening new variation (0-th branch is mainline continuation)
                 writer.write_all(b"(").await?;
             }
 
-            writer.write_all(mov_no.to_string().as_bytes()).await?;
-            writer.write_all(b" ").await?;
-            writer.write_all(mov.mov.to_string().as_bytes()).await?;
-            *mov_idx += 1;
+            let branch = &line.branches[*branchidx];
+            branch.write_line(writer).await?;
 
-            let new_pos = self.data.get(&mov.pos);
-            let parent = parent.clone();
-            let pos = pos.clone();
-            let next_mov_no = mov_no.next();
-            let mov_idx = *mov_idx;
-
-            let transposition = parent != info.path.parent;
-            Self::write_comment(mov, new_pos, transposition, writer).await?;
-
-            if mov_idx >= info.moves.len() {
-                stack.pop();
-                // If that was not the last item - variation just finished
-                if !stack.is_empty() {
-                    writer.write_all(b")").await?;
-                }
-            }
-
-            if !transposition {
-                // We don't analyze transpositions further
-                stack.push((Some(pos.clone()), mov.pos.clone(), 0, next_mov_no));
+            *branchidx += 1;
+            match branch.branches.is_empty() {
+                // Flat branch, immediately close the variation. Note that `branchidx` is already
+                // incremented
+                true if *branchidx > 1 => writer.write_all(b")").await?,
+                // Branching, add variation to the stack
+                false => stack.push((branch, 0)),
+                // Flat branch, main line - don't need to close
+                _ => (),
             }
         }
 
@@ -309,164 +388,6 @@ impl Pgn {
         writer.write_all(b"\n").await?;
         self.write_moves(writer).await?;
         self.write_result(writer).await?;
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct PosInfo {
-    /// Cardinal path to reach the position
-    ///
-    /// Cardinal path to the root position is always empty
-    ///
-    /// The cardinal path for any move occuring on the main line is always the move on the main
-    /// line itself.
-    ///
-    /// If the move is not on the main line, the cardinal position which reaches the position
-    /// branching on smaller moves ids (so using better lines)
-    ///
-    /// If the pathes are picking equally good choices, then the shortest is cardinal.
-    ///
-    /// If the pathes are the same length, the one that branches earlier is cardinal.
-    path: PosPath,
-    /// Ordered moves. The first move is always a main line.
-    moves: Vec<MoveInfo>,
-    /// Engine evaluation.
-    eval: Option<Score>,
-}
-
-impl PosInfo {
-    fn new(fen: &Chess, info: &super::PosInfo) -> Result<Self> {
-        let moves = info
-            .moves
-            .iter()
-            .map(|(mov, info)| MoveInfo::new(fen, mov, info))
-            .collect();
-
-        Ok(Self {
-            moves,
-            eval: info.eval,
-            path: PosPath::default(),
-        })
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct MoveInfo {
-    /// Move played
-    mov: San,
-    /// Position after move
-    pos: Chess,
-}
-
-impl MoveInfo {
-    fn new(board: &Chess, mov: &Move, info: &super::MoveInfo) -> Self {
-        let mov = San::from_move(board, mov);
-
-        Self {
-            mov,
-            pos: info.pos.clone(),
-        }
-    }
-}
-
-/// Describes the path to reach a position for describing transposition.
-///
-/// The path is list of half-moves where not the first move is choosen plus the last half-move
-/// played (even if it was the first one) starting at the root position.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-struct PosPath {
-    /// The path to reach this position. The last item on the path node is the index of which move
-    /// id it was, so how "good" choice it was (lower = better)
-    path: Vec<(MoveNo, San, usize)>,
-    /// The previous position on this path (`None` for root)
-    parent: Option<Chess>,
-}
-
-impl PartialOrd for PosPath {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-/// The better position which reaches the position branching on smaller moves idices (so using better lines)
-///
-/// If the pathes are picking equally good choices, then the shortest is better.
-///
-/// If the pathes are the same length, the one that branches earlier is better.
-impl Ord for PosPath {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        let (tie0, tie2) = self
-            .path
-            .iter()
-            .zip(&other.path)
-            .map(|(mov1, mov2)| {
-                // Returns tiebreakers - first is to determine which path takes lower indicies, second
-                // - which one branches earlier
-                (mov1.2.cmp(&mov2.2), mov1.0.cmp(&mov2.0))
-            })
-            .fold(
-                (std::cmp::Ordering::Equal, std::cmp::Ordering::Equal),
-                |(tie0, tie1), (newt0, newt1)| {
-                    use std::cmp::Ordering::*;
-
-                    let tie0 = match (tie0, newt0) {
-                        (Equal, new) => new,
-                        (old, _) => old,
-                    };
-
-                    let tie1 = match (tie1, newt1) {
-                        (Equal, new) => new,
-                        (old, _) => old,
-                    };
-
-                    (tie0, tie1)
-                },
-            );
-
-        if tie0 != std::cmp::Ordering::Equal {
-            return tie0;
-        }
-
-        match self.path.len().cmp(&other.path.len()) {
-            std::cmp::Ordering::Equal => (),
-            ord => return ord,
-        }
-
-        tie2
-    }
-}
-
-impl PosPath {
-    /// Updates the path if the new path is better. The last move on the path is provided
-    /// separately. The empty path is assumed not to be a root, so it would always be updated!
-    ///
-    /// Returns if the path was updated
-    fn update(&mut self, path: PosPath, parent: Chess) -> bool {
-        if self.path.is_empty() || path < *self {
-            self.path = path.path;
-            self.parent = Some(parent);
-            true
-        } else {
-            false
-        }
-    }
-}
-
-impl Display for PosPath {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut it = self.path.iter();
-
-        if let Some((mov, san, _)) = it.next() {
-            write!(f, "{mov} {san}")?;
-        } else {
-            write!(f, "(root)")?;
-            return Ok(());
-        }
-
-        for (mov, san, _) in it {
-            write!(f, " {mov} {san}")?;
-        }
         Ok(())
     }
 }

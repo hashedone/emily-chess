@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use serde::Deserialize;
-use tracing::Level;
 
 /// General configuration (config.toml schema)
 #[derive(Debug, Deserialize, Default)]

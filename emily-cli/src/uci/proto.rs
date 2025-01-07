@@ -351,6 +351,7 @@ pub struct Info {
     /// The engine line (`pv`)
     pub line: Vec<UciMove>,
     /// Actuall depth the calculation reached
+    #[allow(unused)]
     pub depth: u8,
 }
 

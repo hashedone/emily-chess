@@ -1,16 +1,10 @@
 //! Dispatches possitions and knowledge update across processors
 
-use std::time::Duration;
-
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
-use shakmaty::{Chess, Position};
-use tokio::select;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-use tokio::time::interval;
-use tracing::{info, instrument, warn};
+use tracing::{debug, info, instrument};
 
-use super::processor::{BoxedResult, Processor};
+use super::processor::{Processor, Scheduled};
 use crate::knowledge::Knowledge;
 use crate::Result;
 
@@ -34,52 +28,34 @@ impl<'a> DispatcherBuilder<'a> {
 
     /// Builds a final dispatcher
     pub fn build(self) -> Dispatcher<'a> {
-        let (meta, processors) = self
-            .processors
-            .into_iter()
-            .enumerate()
-            .map(|(idx, processor)| {
-                let (tx, rx) = unbounded_channel();
-                let item = ProcessorItem { processor, rx, idx };
-                let meta = ProcessorMeta {
-                    sender: tx,
-                    total: 0,
-                    completed: 0,
-                };
-                (meta, item)
-            })
-            .unzip();
-
-        Dispatcher { meta, processors }
+        Dispatcher {
+            processors: self
+                .processors
+                .into_iter()
+                .map(|processor| ProcessorItem {
+                    processor,
+                    enqueued: 0,
+                })
+                .collect(),
+            schedule: vec![],
+        }
     }
 }
 
 pub struct Dispatcher<'a> {
-    meta: Vec<ProcessorMeta>,
     processors: Vec<ProcessorItem<'a>>,
-}
-
-struct ProcessorMeta {
-    sender: UnboundedSender<Chess>,
-    total: usize,
-    completed: usize,
+    schedule: Vec<Scheduled>,
 }
 
 struct ProcessorItem<'a> {
     processor: Box<dyn Processor + 'a>,
-    rx: UnboundedReceiver<Chess>,
-    idx: usize,
+    enqueued: usize,
 }
 
 impl ProcessorItem<'_> {
-    async fn wait_pos(mut self) -> Option<(Self, Chess)> {
-        let pos = self.rx.recv().await?;
-        Some((self, pos))
-    }
-
-    async fn process(mut self, pos: Chess) -> (Self, Result<BoxedResult>) {
-        let res = self.processor.process(pos).await;
-        (self, res)
+    async fn process(mut self) -> Self {
+        self.processor.process().await;
+        self
     }
 }
 
@@ -89,91 +65,62 @@ impl<'a> Dispatcher<'a> {
         DispatcherBuilder::new()
     }
 
-    /// Scheddules positions for analysis in every processor
-    fn schedule_pos(meta: &mut [ProcessorMeta], moves: &[Chess]) {
-        for mov in moves {
-            if mov.outcome().is_none() {
-                for m in &mut *meta {
-                    match m.sender.send(mov.clone()) {
-                        Err(err) => warn!(%err, "Error while sending move for processing"),
-                        Ok(()) => {
-                            m.total += 1;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Returns if no more positions would need processing
-    fn all_done(meta: &[ProcessorMeta]) -> bool {
-        meta.iter().all(|m| m.total == m.completed)
-    }
-
     /// Dispatchess position untill they are produced, finishes when no more positions are
     /// scheduled for analysis
-    #[instrument(skip_all, err)]
-    pub async fn dispatch(self, knowledge: &mut Knowledge, root: Chess) -> Result<()> {
-        let mut waiting_pos: FuturesUnordered<_> = self
+    #[instrument(skip(self, knowledge), err)]
+    pub async fn dispatch(
+        mut self,
+        knowledge: &mut Knowledge,
+        variation: usize,
+        hm: usize,
+    ) -> Result<()> {
+        let schedule = &[Scheduled { variation, hm }];
+        let mut processing: FuturesUnordered<_> = self
             .processors
             .into_iter()
-            .map(ProcessorItem::wait_pos)
+            .map(|mut item| {
+                item.processor.enqueue(knowledge, schedule);
+                item.process()
+            })
             .collect();
+        let mut idle: Vec<ProcessorItem> = Vec::with_capacity(processing.len());
 
-        let mut waiting_res = FuturesUnordered::new();
-        let mut meta = self.meta;
+        debug!("Dispatching started");
+        while let Some(mut p) = processing.next().await {
+            let schedule = p
+                .processor
+                .apply_results(knowledge)
+                .into_iter()
+                .filter(|schedule| {
+                    let (variation, _) = knowledge.variation_hm(schedule.variation, schedule.hm);
+                    variation.moves().len() < hm || variation.outcome().is_none()
+                });
 
-        let mut heartbeat = interval(Duration::from_secs(10));
+            self.schedule.extend(schedule);
+            let schedule = &self.schedule[p.enqueued..];
 
-        Self::schedule_pos(&mut meta, &[root]);
+            debug!(total=?self.schedule.len(), "Scheduled new moves moves");
+            p.processor.enqueue(knowledge, schedule);
+            p.enqueued += schedule.len();
 
-        while !Self::all_done(&meta) {
-            select! {
-                Some(Some((mut p, pos))) = waiting_pos.next() => {
-                    match p.processor.should_process(knowledge, &pos) {
-                        Ok(true) =>
-                            waiting_res.push(p.process(pos)),
-                        Ok(false) => {
-                            meta[p.idx].completed += 1;
-                            waiting_pos.push(p.wait_pos());
-                        }
-                        Err(err) => {
-                            warn!(%err, "While processing position");
-                            meta[p.idx].completed += 1;
-                            waiting_pos.push(p.wait_pos())
-                        }
-                    }
-                }
-                Some((p, res)) = waiting_res.next() =>
-                {
-                    meta[p.idx].completed += 1;
+            for mut idl in idle.drain(..) {
+                let schedule = &self.schedule[idl.enqueued..];
+                idl.processor.enqueue(knowledge, schedule);
+                idl.enqueued += schedule.len();
 
-                    match res {
-                        Err(err) => warn!(%err, "Error processing position"),
-                        Ok(res) => {
-                            match res.apply(knowledge) {
-                                Ok(moves) => Self::schedule_pos(&mut meta, &moves),
-                                Err(err) => {
-                                    warn!(%err, "While applying result");
-                                    continue;
-                                }
-                            };
-                        }
-                    }
+                processing.push(idl.process());
+            }
 
-                    waiting_pos.push(p.wait_pos())
-                }
-                _ = heartbeat.tick() => {
-                    let total: usize = meta.iter().map(|m| m.total).sum();
-                    let completed: usize = meta.iter().map(|m| m.completed).sum();
-                    let progress: usize = completed * 100 / total;
-                    info!(total, completed, progress, "Dispatch HB");
-                }
+            match p.processor.is_idle() {
+                true => idle.push(p),
+                false => processing.push(p.process()),
             }
         }
 
-        let total: usize = meta.iter().map(|m| m.total).sum();
-        info!(total_analysed = total, "Dispathing finished");
+        info!(
+            total_analysed = self.schedule.len() + 1,
+            "Dispathing finished"
+        );
 
         Ok(())
     }

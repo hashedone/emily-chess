@@ -7,6 +7,7 @@ edition = "2021"
 async-trait = "0.1.84"
 chrono = "0.4.39"
 color-eyre = "0.6.3"
+derivative = "2.2.0"
 futures = { version = "0.3.31", default-features = false, features = ["alloc", "std"] }
 serde = { version = "1.0.214", features = ["derive"] }
 shakmaty = "0.27.2"
