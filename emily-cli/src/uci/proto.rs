@@ -4,17 +4,24 @@ use std::time::Duration;
 
 use color_eyre::eyre::{bail, Context, OptionExt};
 use color_eyre::Result;
+use derivative::Derivative;
 use serde::{Deserialize, Serialize};
 use shakmaty::fen::Fen;
 use shakmaty::uci::UciMove;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{ChildStdin, ChildStdout};
-use tracing::{debug, warn};
+use tracing::{debug, instrument, trace, warn, Level};
 
+use crate::adapters::debug::{DFenExt, FlatOptExt, LineExt};
+
+#[derive(Derivative)]
+#[derivative(Debug)]
 pub struct Protocol {
+    #[derivative(Debug = "ignore")]
     stdin: ChildStdin,
+    #[derivative(Debug = "ignore")]
     stdout: Lines<BufReader<ChildStdout>>,
-    name: String,
+    engine: String,
 }
 
 impl Protocol {
@@ -22,10 +29,11 @@ impl Protocol {
         Self {
             stdin,
             stdout: BufReader::new(stdout).lines(),
-            name: String::new(),
+            engine: String::new(),
         }
     }
 
+    #[instrument(err)]
     async fn send(&mut self, command: Command) -> Result<()> {
         let mut command = command.to_string();
         command.push('\n');
@@ -35,10 +43,11 @@ impl Protocol {
             .await
             .wrap_err("While writting to engine")?;
 
-        debug!("UCI send: {}", command.trim());
+        trace!("UCI send: {}", command.trim());
         Ok(())
     }
 
+    #[instrument(err, ret(level=Level::TRACE))]
     async fn recv(&mut self) -> Result<Msg> {
         loop {
             let line = self
@@ -50,7 +59,7 @@ impl Protocol {
 
             let line = line.trim();
             if !line.is_empty() {
-                debug!("UCI recv: {}", line);
+                trace!("UCI recv: {}", line);
                 if let Some(msg) = Msg::parse(line) {
                     return Ok(msg);
                 }
@@ -58,18 +67,17 @@ impl Protocol {
         }
     }
 
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
+    #[instrument(err)]
     pub async fn debug(&mut self) -> Result<()> {
         self.send(Command::Debug).await
     }
 
+    #[instrument(err)]
     pub async fn set_option(&mut self, option: String, value: String) -> Result<()> {
         self.send(Command::SetOption(option, value)).await
     }
 
+    #[instrument(err)]
     pub async fn init(&mut self) -> Result<()> {
         self.send(Command::Uci).await?;
 
@@ -77,7 +85,9 @@ impl Protocol {
             use Msg::*;
 
             match self.recv().await? {
-                Id { name: Some(n), .. } => self.name = n,
+                Id { name: Some(n), .. } => {
+                    self.engine = n;
+                }
                 UciOk => break,
                 _ => (),
             }
@@ -86,6 +96,7 @@ impl Protocol {
         Ok(())
     }
 
+    #[instrument(err)]
     pub async fn wait_ready(&mut self) -> Result<()> {
         self.send(Command::IsReady).await?;
 
@@ -94,34 +105,21 @@ impl Protocol {
         Ok(())
     }
 
+    #[instrument(err)]
     pub async fn new_game(&mut self) -> Result<()> {
         self.send(Command::NewGame).await
     }
 
     /// Sets the position for analysis
-    pub async fn position(
-        &mut self,
-        fen: impl Into<Option<Fen>>,
-        moves: impl IntoIterator<Item = UciMove>,
-    ) -> Result<()> {
-        self.send(Command::Position {
-            fen: fen.into(),
-            line: moves.into_iter().collect(),
-        })
-        .await
+    #[instrument(skip(fen, moves), fields(fen=?fen.d_fen(), moves=?moves.d_line()), err)]
+    pub async fn position(&mut self, fen: Option<Fen>, moves: Vec<UciMove>) -> Result<()> {
+        self.send(Command::Position { fen, line: moves }).await
     }
 
     /// Starts the game analysis
-    pub async fn go(
-        &mut self,
-        depth: impl Into<Option<u8>>,
-        time: impl Into<Option<Duration>>,
-    ) -> Result<InfoStream> {
-        self.send(Command::Go {
-            depth: depth.into(),
-            time: time.into(),
-        })
-        .await?;
+    #[instrument(skip(depth, time), fields(depth=?depth.d_opt(), time=?time.d_opt()), err)]
+    pub async fn go(&mut self, depth: Option<u8>, time: Option<Duration>) -> Result<InfoStream> {
+        self.send(Command::Go { depth, time }).await?;
 
         Ok(InfoStream {
             proto: self,
@@ -129,6 +127,7 @@ impl Protocol {
         })
     }
 
+    #[instrument(err)]
     pub async fn quit(&mut self) -> Result<()> {
         self.send(Command::Quit).await
     }
@@ -199,7 +198,8 @@ impl InfoStream<'_> {
 }
 
 /// Command send to the engine
-#[derive(Debug)]
+#[derive(Derivative)]
+#[derivative(Debug)]
 enum Command {
     /// Intialize UCI mode
     Uci,
@@ -214,15 +214,19 @@ enum Command {
     /// Setup the position
     Position {
         /// Position FEN - if missing, startpos will be used
+        #[derivative(Debug(format_with = "DFenExt::fmt"))]
         fen: Option<Fen>,
         /// Moves after the intial FEN
+        #[derivative(Debug(format_with = "LineExt::fmt"))]
         line: Vec<UciMove>,
     },
     /// Start evaluation
     Go {
         /// Limit depth search
+        #[derivative(Debug(format_with = "FlatOptExt::fmt"))]
         depth: Option<u8>,
         /// Limit search time
+        #[derivative(Debug(format_with = "FlatOptExt::fmt"))]
         time: Option<Duration>,
     },
     /// Stop engine evaluation as soon as possible
@@ -255,7 +259,6 @@ impl Display for Command {
                         write!(f, " {m}")?;
                     }
                 }
-
                 Ok(())
             }
             Go { depth, time } => {
@@ -282,16 +285,20 @@ impl Display for Command {
 }
 
 /// Messages received from engine
-#[derive(Debug)]
+#[derive(Derivative)]
+#[derivative(Debug)]
 enum Msg {
     /// Information about engine
-    Id { name: Option<String> },
+    Id {
+        #[derivative(Debug(format_with = "FlatOptExt::fmt"))]
+        name: Option<String>,
+    },
     /// Initialization complete
     UciOk,
     /// IO sync
     ReadyOk,
     /// Analysis complete
-    BestMove(UciMove),
+    BestMove(#[derivative(Debug(format_with = "Display::fmt"))] UciMove),
     /// Analysis step
     Info(Info),
 }
@@ -340,7 +347,8 @@ impl Msg {
 }
 
 /// Engine analysis info
-#[derive(Debug)]
+#[derive(Derivative)]
+#[derivative(Debug)]
 pub struct Info {
     /// Line number (1 - best, 2 - second the best, ...). If not send (single-line mode) it will be
     /// defaulted to 1.
@@ -349,6 +357,7 @@ pub struct Info {
     /// Engine evaluation
     pub score: Score,
     /// The engine line (`pv`)
+    #[derivative(Debug(format_with = "LineExt::fmt"))]
     pub line: Vec<UciMove>,
     /// Actuall depth the calculation reached
     #[allow(unused)]

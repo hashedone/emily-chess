@@ -1,20 +1,29 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use derivative::Derivative;
 use serde::Deserialize;
 
+use crate::adapters::debug::FlatOptExt;
+
 /// General configuration (config.toml schema)
-#[derive(Debug, Deserialize, Default)]
+#[derive(Derivative, Deserialize, Default)]
+#[derivative(Debug)]
 pub struct Config {
     /// Engine configuration
+    #[derivative(Debug(format_with = "FlatOptExt::fmt"))]
     pub engine: Option<Engine>,
     /// Game review configuration
     #[serde(default)]
     pub rev: Rev,
+    /// Logging configuration
+    #[serde(default)]
+    pub logging: Logging,
 }
 
 /// Cross-functionality engine configuration
-#[derive(Debug, Deserialize)]
+#[derive(Derivative, Deserialize)]
+#[derivative(Debug)]
 pub struct Engine {
     /// Engine name for debugging and caching
     pub name: String,
@@ -24,6 +33,7 @@ pub struct Engine {
     #[serde(default)]
     pub args: Vec<String>,
     /// Path where the engine should be executed
+    #[derivative(Debug(format_with = "FlatOptExt::fmt"))]
     pub pwd: Option<String>,
     /// Engine options set on startup
     #[serde(default)]
@@ -34,10 +44,19 @@ pub struct Engine {
 }
 
 /// Game review configuration
-#[derive(Debug, Deserialize, Default)]
+#[derive(Derivative, Deserialize, Default)]
+#[derivative(Debug)]
 pub struct Rev {
     /// Analysis depth limit (per move)
+    #[derivative(Debug(format_with = "FlatOptExt::fmt"))]
     pub depth: Option<u8>,
     /// Analysis time limit (per move)
+    #[derivative(Debug(format_with = "FlatOptExt::fmt"))]
     pub time: Option<Duration>,
+}
+
+#[derive(Deserialize, Default, Debug)]
+pub struct Logging {
+    /// Filter directives to attach
+    pub filter: Vec<String>,
 }

@@ -1,5 +1,6 @@
 //! UCI protocol implementation and engine interface
 
+use derivative::Derivative;
 use shakmaty::fen::Fen;
 use shakmaty::uci::UciMove;
 use shakmaty::{Chess, EnPassantMode, Move};
@@ -11,17 +12,23 @@ use tokio::process;
 use color_eyre::eyre::{Context, OptionExt};
 use color_eyre::Result;
 use tokio::spawn;
-use tracing::{error, info, instrument, warn};
+use tracing::{error, info, instrument, trace, warn};
 
 use self::proto::{InfoStream, Protocol};
+use crate::adapters::debug::{DFenExt, FlatOptExt, LineExt};
 
 pub use self::proto::Score;
 
 mod proto;
 
+#[derive(Derivative)]
+#[derivative(Debug)]
 pub struct Engine {
+    #[derivative(Debug = "ignore")]
     task: tokio::task::JoinHandle<()>,
+    #[derivative(Debug = "ignore")]
     proto: Protocol,
+    name: String,
 }
 
 impl Drop for Engine {
@@ -31,27 +38,29 @@ impl Drop for Engine {
 }
 
 impl Engine {
-    async fn configure(&mut self, config: crate::config::Engine) -> Result<()> {
+    #[instrument(skip(config))]
+    async fn configure(&mut self, config: crate::config::Engine) {
         if config.debug {
-            self.proto.debug().await?;
+            trace!("Enabling debug engine mode");
+            if let Err(err) = self.proto.debug().await {
+                warn!(%err, "While setting engine debug mode");
+            }
         }
 
         for (option, value) in config.options {
             if let Err(err) = self.proto.set_option(option, value).await {
-                warn!("While setting engine option: {err}");
+                warn!(%err, "While setting engine option");
             }
         }
 
-        info!(engine = self.proto.name(), "Engine configured");
-        Ok(())
+        trace!("Engine configured");
     }
 
-    #[instrument(err)]
+    #[instrument(skip(config), err)]
     pub async fn run(config: crate::config::Engine) -> Result<Engine> {
-        info!(cmd = ?config.command, args = ?config.args, pwd = ?config.pwd, "Starting engine");
+        trace!(?config, "Starting engine");
 
         let mut command = process::Command::new(&config.command);
-
         command
             .args(&config.args)
             .stdin(Stdio::piped())
@@ -63,12 +72,14 @@ impl Engine {
             command.current_dir(pwd);
         }
 
+        trace!(?command, "Execution command prepared");
         let mut process = command.spawn().wrap_err("While starting engine")?;
 
         let stdin = process
             .stdin
             .take()
             .ok_or_eyre("Cannot open engine stdin")?;
+
         let stdout = process
             .stdout
             .take()
@@ -86,7 +97,7 @@ impl Engine {
                             }
                             Ok(None) => break,
                             Ok(Some(line)) => {
-                                warn!("Engine: {line}")
+                                warn!(err = line, "Engine stderr")
                             }
                         }
                     }
@@ -100,42 +111,45 @@ impl Engine {
 
         let task = spawn(async move {
             match process.wait().await {
-                Ok(code) => info!("Engine exited with code {code}"),
-                Err(err) => error!("While running engine: {err}"),
+                Ok(code) => info!(%code, "Engine exited"),
+                Err(err) => error!(?err, "While running engine"),
             }
         });
 
-        let mut engine = Self { task, proto };
+        let mut engine = Self {
+            task,
+            proto,
+            name: config.name.clone(),
+        };
 
         engine.proto.init().await?;
-        info!(engine = engine.proto.name(), "Engine initialized");
+        trace!("Engine initialized");
 
-        engine.configure(config).await?;
-
+        engine.configure(config).await;
         Ok(engine)
     }
 
-    #[instrument(skip_all, err)]
+    #[instrument(err)]
     pub async fn new_game(&mut self) -> Result<()> {
         self.proto.new_game().await?;
         self.proto.wait_ready().await
     }
 
-    #[instrument(skip_all, fields(?depth, ?time), err)]
+    #[instrument(skip(fen, moves, depth, time), fields(fen=?fen.d_fen(), moves=?moves.d_line(), depth=?depth.d_opt(), time=?time.d_opt()), err)]
     pub async fn go(
         &mut self,
         fen: Chess,
-        moves: impl IntoIterator<Item = &Move>,
+        moves: &[Move],
         depth: Option<u8>,
         time: Option<Duration>,
     ) -> Result<InfoStream> {
         let fen = Fen::from_position(fen, EnPassantMode::Always);
-        let moves = moves.into_iter().map(UciMove::from_standard);
-        self.proto.position(fen, moves).await?;
+        let moves = moves.iter().map(UciMove::from_standard).collect();
+        self.proto.position(Some(fen), moves).await?;
         self.proto.go(depth, time).await
     }
 
-    #[instrument(skip_all, err)]
+    #[instrument(err)]
     pub async fn quit(mut self) -> Result<()> {
         self.proto.quit().await
     }

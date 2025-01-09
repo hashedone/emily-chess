@@ -1,12 +1,14 @@
 //! The knowledge about positions we gathered for a single game/analysis
 
 use std::collections::HashMap;
+use std::fmt::Formatter;
 
 use color_eyre::eyre::ensure;
+use derivative::Derivative;
 use shakmaty::{Chess, Move, Outcome, Position};
-use tracing::{debug, instrument, trace, warn};
+use tracing::{debug, instrument, trace};
 
-use crate::adapters::TracingAdapt;
+use crate::adapters::debug::{DFenExt, FlatOptExt, LineExt, MovExt};
 use crate::uci::Score;
 use crate::Result;
 
@@ -17,14 +19,17 @@ mod pgn;
 /// The single variation considered. Variations describes a particular way a position is reached
 /// and it is possible for a variation to repeat a position (up to three times after which draw is
 /// assumed)
-#[derive(Debug, Clone)]
+#[derive(Derivative, Clone)]
+#[derivative(Debug)]
 pub struct Variation {
     /// Moves in this variation
+    #[derivative(Debug(format_with = "LineExt::fmt"))]
     moves: Vec<Move>,
     /// Positions in this variation, including the root position. Note that the position after the
     /// move `idx` is here at the `idx + 1` index.
     positions: Vec<usize>,
     /// Variation outcome (after the last move)
+    #[derivative(Debug(format_with = "FlatOptExt::fmt"))]
     outcome: Option<Outcome>,
 }
 
@@ -57,17 +62,29 @@ impl Variation {
 }
 
 /// Single position details
-#[derive(Debug)]
+#[derive(Derivative)]
+#[derivative(Debug)]
 pub struct PosInfo {
     /// Position itself
+    #[derivative(Debug(format_with = "DFenExt::fmt"))]
     pos: Chess,
     /// Moves we consider from this position.
+    #[derivative(Debug(format_with = "PosInfo::fmt_moves"))]
     moves: HashMap<Move, MoveInfo>,
     /// Engine evaluation of the position.
+    #[derivative(Debug(format_with = "FlatOptExt::fmt"))]
     eval: Option<Score>,
 }
 
 impl PosInfo {
+    fn fmt_moves(moves: &HashMap<Move, MoveInfo>, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let mut map = f.debug_map();
+        for (mov, info) in moves {
+            map.entry(&mov.d_mov(), info);
+        }
+        map.finish()
+    }
+
     fn new(pos: Chess) -> Self {
         Self {
             pos,
@@ -95,7 +112,8 @@ pub struct MoveInfo;
 
 /// All we know about the analyzed moves. This type has to be exportable (and importable) from/into
 /// PGN.
-#[derive(Debug)]
+#[derive(Derivative)]
+#[derivative(Debug)]
 pub struct Knowledge {
     /// Information per position - same position reached the same way are considered the same, even
     /// if there was a repetition, which means this is not suitable for game storage as it would
@@ -103,6 +121,8 @@ pub struct Knowledge {
     positions: Vec<PosInfo>,
     /// Position index for `positions`. Note, that positions are not considering how the position was
     /// reached or if the position was repeated before.
+    // Ignoring on debug, as positions themself contains the index
+    #[derivative(Debug = "ignore")]
     index: HashMap<Chess, usize>,
     /// Variations we considered.
     variations: Vec<Variation>,
@@ -112,9 +132,8 @@ pub struct Knowledge {
 
 impl Knowledge {
     /// Creates new knowledge base
-    #[instrument(skip_all, fields(root = root.tr()))]
     pub fn new(root: Chess) -> Self {
-        debug!("Creating knowledge base");
+        trace!(root = ?root.d_fen(), "Creating Knowledge");
         Self {
             // Indexing `root` position as first position occuring
             index: std::iter::once((root.clone(), 0)).collect(),
@@ -124,47 +143,38 @@ impl Knowledge {
         }
     }
 
-    /// Accesses the variation returning it paired with position info after it is reached. The
-    /// position information is returned as mutable reference, so it can be immmediately updated.
-    #[instrument(skip(self))]
-    pub fn variation_mut(&mut self, idx: usize) -> (&Variation, &mut PosInfo) {
-        trace!("Accessing variation");
-        let variation = &self.variations[idx];
-        let lastposidx = *variation.positions.last().unwrap_or(&0);
-        let lastpos = &mut self.positions[lastposidx];
-
-        (variation, lastpos)
-    }
-
     /// Accesses the variation and the position information after `hm` halfmoves.
-    #[instrument(skip(self))]
     pub fn variation_hm(&self, idx: usize, hm: usize) -> (&Variation, &PosInfo) {
-        trace!("Accessing variation");
         let variation = &self.variations[idx];
         let posidx = variation.positions[hm];
         let pos = &self.positions[posidx];
 
+        trace!(
+            idx,
+            hm,
+            ?variation,
+            posidx,
+            ?pos,
+            "Accessing variation at move"
+        );
         (variation, pos)
     }
 
     /// Accesses the variation and the position information after `hm` halfmoves.
-    #[instrument(skip(self))]
     pub fn variation_hm_mut(&mut self, idx: usize, hm: usize) -> (&Variation, &mut PosInfo) {
-        trace!("Accessing variation");
         let variation = &self.variations[idx];
         let posidx = variation.positions[hm];
         let pos = &mut self.positions[posidx];
 
+        trace!(
+            idx,
+            hm,
+            ?variation,
+            posidx,
+            ?pos,
+            "Accessing variation at move mutably"
+        );
         (variation, pos)
-    }
-
-    /// Accesses the main line, just like `Knowledge::variation_mut` but additionally returning the
-    /// index to the main line variation.
-    #[instrument(skip_all)]
-    pub fn main_variation_mut(&mut self) -> (usize, &Variation, &mut PosInfo) {
-        trace!("Accessing variation");
-        let (variation, lastpos) = self.variation_mut(0);
-        (0, variation, lastpos)
     }
 
     /// Adds new move to the variation after `hm` halfmoves played after the root position. If
@@ -175,7 +185,7 @@ impl Knowledge {
     /// variation and mutable position info after the move played. Note, that it doesn't have to be
     /// after the whole variation (for example if variation was already extended with this move,
     /// and more moves after that).
-    #[instrument(skip(self), err)]
+    #[instrument(skip(self, mov), fields(mov = ?mov.d_mov()), err)]
     pub fn add_move(
         &mut self,
         vidx: usize,
@@ -192,10 +202,16 @@ impl Knowledge {
 
         if variation.moves.get(hm + 1) == Some(&mov) {
             // This variation includes move that is being added
-            debug!("Adding a move already included in this variation");
             let variation = &self.variations[vidx];
             let posidx = variation.positions[hm + 2];
             let position = &mut self.positions[posidx];
+
+            trace!(
+                ?variation,
+                posidx,
+                ?position,
+                "Accessing a move already included in this variation"
+            );
 
             return Ok((vidx, variation, position));
         }
@@ -208,8 +224,15 @@ impl Knowledge {
         // Move is to be added - we need to calculate position after it
         let beforeidx = variation.positions[hm];
         let beforefen = self.positions[beforeidx].pos.clone();
+        debug!(
+            idx = beforeidx,
+            fen = ?beforefen.d_fen(),
+            "Position before the move to be added lookup"
+        );
+
         let afterfen = beforefen.play(&mov)?;
         let outcome = afterfen.outcome();
+        debug!(fen = ?afterfen.d_fen(), outcome = ?outcome.d_opt(), "Position after the move is played calculated");
 
         // Look for a position in index. If position did not occur, we will add new position to the
         // index. The newly created position would always be added to the end of the list.
@@ -221,6 +244,7 @@ impl Knowledge {
         if afteridx == self.positions.len() {
             // Adding new position info
             self.positions.push(PosInfo::new(afterfen));
+            debug!(idx = afteridx, "Position added to the knowledge");
         }
 
         let vidx = match variation.moves.len() == hm {
@@ -228,7 +252,7 @@ impl Knowledge {
             true => vidx,
             false => {
                 // Branching variation
-                debug!(newidx = self.variations.len(), "Branching variation");
+                debug!(idx = self.variations.len(), "Branching variation");
 
                 let moves = variation.moves[..hm].to_owned();
                 let positions = variation.positions[..=hm].to_owned();
@@ -257,42 +281,43 @@ impl Knowledge {
 
         let variation = &self.variations[vidx];
         let position = &mut self.positions[afteridx];
+        trace!(?variation, ?position, "Move added");
 
         Ok((vidx, variation, position))
     }
 
     /// Updates mainline if `from` is mainline right now
-    #[instrument(skip(self))]
     pub fn update_mainline(&mut self, from: usize, to: usize) {
         if from == self.main && to < self.variations.len() {
-            debug!("Updating mainline");
+            trace!(from, to, "Updating mainline");
             self.main = to;
         }
     }
 
     /// Acceses position by its index
-    pub fn position(&self, pidx: usize) -> &PosInfo {
-        &self.positions[pidx]
-    }
-
-    /// Acceses position by its index
-    pub fn position_mut(&mut self, pidx: usize) -> &mut PosInfo {
-        &mut self.positions[pidx]
-    }
-
-    /// Accesses the given move details on a position if available
-    pub fn movinfo(&self, pidx: usize, mov: &Move) -> Option<&MoveInfo> {
-        self.positions[pidx].moves.get(mov)
+    pub fn position(&self, idx: usize) -> &PosInfo {
+        let position = &self.positions[idx];
+        trace!(idx, ?position, "Accessing position");
+        position
     }
 
     /// Return root `PosInfo`
     pub fn root(&self) -> &PosInfo {
         let mainline = &self.variations[self.main];
-        &self.positions[mainline.positions[0]]
+        let idx = mainline.positions[0];
+        let position = &self.positions[idx];
+        trace!(
+            mainline = self.main,
+            idx,
+            ?position,
+            "Accessing root position"
+        );
+        position
     }
 
     /// Retrieves PGN representation for storage
     pub fn pgn(&self) -> Pgn {
+        trace!("Generating PGN");
         Pgn::new(self)
     }
 }

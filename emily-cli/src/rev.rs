@@ -6,9 +6,9 @@ use shakmaty::{CastlingMode, Chess};
 use structopt::StructOpt;
 use tokio::fs::File;
 use tokio::spawn;
-use tracing::{debug, error, info, instrument};
+use tracing::{error, info, instrument, trace};
 
-use crate::adapters::TracingAdapt;
+use crate::adapters::debug::DFenExt;
 use crate::knowledge::Knowledge;
 use crate::Config;
 use color_eyre::Result;
@@ -39,7 +39,7 @@ pub struct Rev {
 impl Rev {
     #[instrument(skip(self, config), err)]
     pub async fn run(self, config: Config) -> Result<()> {
-        debug!(?self, "Position review");
+        info!(?self, "Position review");
 
         let mut engine = engine::Engine::new(
             config.engine.ok_or_eyre("No engine configuration")?,
@@ -48,7 +48,7 @@ impl Rev {
         .await?;
 
         let root = self.fen.unwrap_or_default();
-        info!(pos = %root.tr(), "Analyzing position");
+        trace!(pos = ?root.d_fen(), "Analyzing position");
 
         let mut knowledge = Knowledge::new(root.clone());
 

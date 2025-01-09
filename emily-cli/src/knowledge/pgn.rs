@@ -1,3 +1,4 @@
+use std::fmt::{Debug, Formatter};
 use std::num::NonZeroU32;
 
 use chrono::Local;
@@ -8,10 +9,20 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tracing::{debug, instrument};
 
 use super::{Knowledge, MoveInfo, PosInfo, Variation};
+use crate::adapters::debug::{FlatOptExt, MovExt};
 use crate::Result;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct MoveNo(NonZeroU32, Color);
+
+impl Debug for MoveNo {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self.1 {
+            Color::White => write!(f, "{}.", self.0),
+            Color::Black => write!(f, "{}...", self.0),
+        }
+    }
+}
 
 impl MoveNo {
     fn new(pos: &impl Position) -> Self {
@@ -34,8 +45,29 @@ impl PartialOrd for MoveNo {
     }
 }
 
+impl Ord for MoveNo {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (self, other) {
+            (MoveNo(m1, Color::White), MoveNo(m2, Color::Black)) if m1 == m2 => {
+                std::cmp::Ordering::Less
+            }
+            (MoveNo(m1, Color::Black), MoveNo(m2, Color::White)) if m1 == m2 => {
+                std::cmp::Ordering::Greater
+            }
+            (MoveNo(m1, _), MoveNo(m2, _)) if m1 == m2 => std::cmp::Ordering::Equal,
+            (MoveNo(m1, _), MoveNo(m2, _)) => m1.cmp(m2),
+        }
+    }
+}
+
+impl std::fmt::Display for MoveNo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Debug::fmt(self, f)
+    }
+}
+
 /// A single PGN move
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct Mov<'a> {
     /// Move played
     mov: San,
@@ -46,6 +78,18 @@ struct Mov<'a> {
     movinfo: Option<&'a MoveInfo>,
     /// Information about the position after the move played
     posinfo: &'a PosInfo,
+}
+
+// For some reason doing it with derivative makes some lifetimes problems
+impl Debug for Mov<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Mov")
+            .field("mov", &self.mov.d_mov())
+            .field("no", &self.no)
+            .field("movinfo", &self.movinfo.d_opt())
+            .field("posinfo", &self.posinfo)
+            .finish()
+    }
 }
 
 impl Mov<'_> {
@@ -160,30 +204,6 @@ impl<'a> Node<'a> {
             });
 
             (self.branches.last_mut().unwrap(), 1)
-        }
-    }
-}
-
-impl Ord for MoveNo {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        match (self, other) {
-            (MoveNo(m1, Color::White), MoveNo(m2, Color::Black)) if m1 == m2 => {
-                std::cmp::Ordering::Less
-            }
-            (MoveNo(m1, Color::Black), MoveNo(m2, Color::White)) if m1 == m2 => {
-                std::cmp::Ordering::Greater
-            }
-            (MoveNo(m1, _), MoveNo(m2, _)) if m1 == m2 => std::cmp::Ordering::Equal,
-            (MoveNo(m1, _), MoveNo(m2, _)) => m1.cmp(m2),
-        }
-    }
-}
-
-impl std::fmt::Display for MoveNo {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.1 {
-            Color::White => write!(f, "{}.", self.0),
-            Color::Black => write!(f, "{}...", self.0),
         }
     }
 }
